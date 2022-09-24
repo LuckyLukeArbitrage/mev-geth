@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"runtime"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -865,6 +867,137 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 		}
 	}
 	return api.traceTx(ctx, msg, new(Context), vmctx, statedb, traceConfig)
+}
+
+// TraceCallMany lets you trace a given eth_call. It collects the structured logs created during the execution of EVM
+// if the given transaction was added on top of the provided block and returns them as a JSON object.
+// You can provide -2 as a block number to trace on top of the pending block.
+func (api *API) TraceCallMany(ctx context.Context, txs []ethapi.TransactionArgs, stateBlockNrOrHash rpc.BlockNumberOrHash, blockNrOrHash rpc.BlockNumberOrHash, config *TraceCallConfig) (interface{}, error) {
+	// Try to retrieve the specified stateBlock
+	var (
+		err        error
+		stateBlock *types.Block
+		block      *types.Block
+		header     *types.Header
+	)
+
+	if hash, ok := stateBlockNrOrHash.Hash(); ok {
+		stateBlock, err = api.blockByHash(ctx, hash)
+	} else if number, ok := stateBlockNrOrHash.Number(); ok {
+		stateBlock, err = api.blockByNumber(ctx, number)
+	} else {
+		return nil, errors.New("invalid arguments; neither block nor hash specified")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if hash, ok := blockNrOrHash.Hash(); ok {
+		block, err = api.blockByHash(ctx, hash)
+		header = block.Header()
+	} else if number, ok := blockNrOrHash.Number(); ok {
+		block, err = api.blockByNumber(ctx, number)
+		if err == nil {
+			header = block.Header()
+		} else {
+			blockNumber := big.NewInt(number.Int64())
+			timestamp := stateBlock.Header().Time + 1
+			if timestamp < uint64(time.Now().Unix()) {
+				timestamp = uint64(time.Now().Unix())
+			}
+			coinbase := stateBlock.Header().Coinbase
+			difficulty := stateBlock.Header().Difficulty
+			gasLimit := stateBlock.Header().GasLimit
+			var baseFee *big.Int
+			baseFee = misc.CalcBaseFee(api.backend.ChainConfig(), stateBlock.Header())
+			header = &types.Header{
+				ParentHash: stateBlock.Header().Hash(),
+				Number:     blockNumber,
+				GasLimit:   gasLimit,
+				Time:       timestamp,
+				Difficulty: difficulty,
+				Coinbase:   coinbase,
+				BaseFee:    baseFee,
+			}
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// try to recompute the state
+	reexec := defaultTraceReexec
+	if config != nil && config.Reexec != nil {
+		reexec = *config.Reexec
+	}
+	statedb, err := api.backend.StateAtBlock(ctx, stateBlock, reexec, nil, true, false)
+	if err != nil {
+		return nil, err
+	}
+	// Apply the customized state rules if required.
+	if config != nil {
+		if err := config.StateOverrides.Apply(statedb); err != nil {
+			return nil, err
+		}
+	}
+
+	var traceConfig *TraceConfig
+	if config != nil {
+		traceConfig = &TraceConfig{
+			Config:  config.Config,
+			Tracer:  config.Tracer,
+			Timeout: config.Timeout,
+			Reexec:  config.Reexec,
+		}
+	}
+
+	var results = make([]interface{}, len(txs))
+	for idx, args := range txs {
+		// Execute the trace
+		msg, err := args.ToMessage(api.backend.RPCGasCap(), stateBlock.BaseFee())
+		if err != nil {
+			results[idx] = &txTraceResult{Error: err.Error()}
+			continue
+		}
+		vmctx := core.NewEVMBlockContext(header, api.chainContext(ctx), nil)
+
+		originalCanTransfer := vmctx.CanTransfer
+		originalTransfer := vmctx.Transfer
+
+		// This is needed for trace_call (debug mode),
+		// as the Transaction is being run on top of the block transactions,
+		// which might lead into ErrInsufficientFundsForTransfer error
+		vmctx.CanTransfer = func(db vm.StateDB, sender common.Address, amount *big.Int) bool {
+			if msg.From() == sender {
+				return true
+			}
+			res := originalCanTransfer(db, sender, amount)
+			return res
+		}
+
+		// If the actual transaction would fail, then their is no reason to actually transfer any balance at all
+		vmctx.Transfer = func(db vm.StateDB, sender, recipient common.Address, amount *big.Int) {
+			toAmount := new(big.Int).Set(amount)
+
+			senderBalance := db.GetBalance(sender)
+			if senderBalance.Cmp(toAmount) < 0 {
+				toAmount.Set(big.NewInt(0))
+			}
+
+			originalTransfer(db, sender, recipient, toAmount)
+		}
+
+		res, err := api.traceTx(ctx, msg, new(Context), vmctx, statedb, traceConfig)
+		if err != nil {
+			results[idx] = &txTraceResult{Error: err.Error()}
+			continue
+		}
+
+		results[idx] = res
+	}
+
+	return results, nil
 }
 
 // traceTx configures a new tracer according to the provided configuration, and

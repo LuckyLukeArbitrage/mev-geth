@@ -734,10 +734,10 @@ func (s *BlockChainAPI) GetHeaderByHash(ctx context.Context, hash common.Hash) m
 }
 
 // GetBlockByNumber returns the requested canonical block.
-// * When blockNr is -1 the chain head is returned.
-// * When blockNr is -2 the pending chain head is returned.
-// * When fullTx is true all transactions in the block are returned, otherwise
-//   only the transaction hash is returned.
+//   - When blockNr is -1 the chain head is returned.
+//   - When blockNr is -2 the pending chain head is returned.
+//   - When fullTx is true all transactions in the block are returned, otherwise
+//     only the transaction hash is returned.
 func (s *BlockChainAPI) GetBlockByNumber(ctx context.Context, number rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
 	block, err := s.b.BlockByNumber(ctx, number)
 	if block != nil && err == nil {
@@ -2092,12 +2092,6 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 	if state == nil || err != nil {
 		return nil, err
 	}
-	blockNumber := big.NewInt(int64(args.BlockNumber))
-
-	timestamp := parent.Time + 1
-	if args.Timestamp != nil {
-		timestamp = *args.Timestamp
-	}
 	coinbase := parent.Coinbase
 	if args.Coinbase != nil {
 		coinbase = common.HexToAddress(*args.Coinbase)
@@ -2110,20 +2104,49 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 	if args.GasLimit != nil {
 		gasLimit = *args.GasLimit
 	}
+
+	blockNumber := big.NewInt(int64(args.BlockNumber))
+
 	var baseFee *big.Int
-	if args.BaseFee != nil {
-		baseFee = args.BaseFee
-	} else if s.b.ChainConfig().IsLondon(big.NewInt(args.BlockNumber.Int64())) {
-		baseFee = misc.CalcBaseFee(s.b.ChainConfig(), parent)
-	}
-	header := &types.Header{
-		ParentHash: parent.Hash(),
-		Number:     blockNumber,
-		GasLimit:   gasLimit,
-		Time:       timestamp,
-		Difficulty: difficulty,
-		Coinbase:   coinbase,
-		BaseFee:    baseFee,
+	_, header, err := s.b.StateAndHeaderByNumber(ctx, args.BlockNumber)
+	if header == nil || err != nil {
+
+		timestamp := parent.Time + 1
+		if timestamp < uint64(time.Now().Unix()) {
+			timestamp = uint64(time.Now().Unix())
+		}
+		if args.Timestamp != nil {
+			timestamp = *args.Timestamp
+		}
+
+		if args.BaseFee != nil {
+			baseFee = args.BaseFee
+		} else if parent.Number.Int64() == args.BlockNumber.Int64() {
+			baseFee = parent.BaseFee
+		} else if s.b.ChainConfig().IsLondon(big.NewInt(args.BlockNumber.Int64())) {
+			baseFee = misc.CalcBaseFee(s.b.ChainConfig(), parent)
+		}
+		header = &types.Header{
+			ParentHash: parent.Hash(),
+			Number:     blockNumber,
+			GasLimit:   gasLimit,
+			Time:       timestamp,
+			Difficulty: difficulty,
+			Coinbase:   coinbase,
+			BaseFee:    baseFee,
+		}
+		err = nil
+	} else {
+		//create a real copy of the header not that we update anything (strange errors seen and not sure if it was because of this update)
+		header = &types.Header{
+			ParentHash: parent.Hash(),
+			Number:     blockNumber,
+			GasLimit:   header.GasLimit,
+			Time:       header.Time,
+			Difficulty: new(big.Int).Set(header.Difficulty),
+			Coinbase:   header.Coinbase,
+			BaseFee:    new(big.Int).Set(header.BaseFee),
+		}
 	}
 
 	// Setup context so it may be cancelled the call has completed
